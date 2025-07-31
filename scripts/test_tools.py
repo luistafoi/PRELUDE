@@ -1,112 +1,101 @@
+# scripts/test_tools.py
+
 import sys
 import os
 import torch
+import random
+from collections import defaultdict
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.args import read_args
 from dataloaders.data_loader import PRELUDEDataset
 from dataloaders.data_generator import DataGenerator
+from dataloaders.feature_loader import FeatureLoader
 from models.tools import HetAgg
 
-# Load args
+# --- Prerequisites ---
+NEIGHBOR_FILE = "data/processed/train_neighbors.txt"
+if not os.path.exists(NEIGHBOR_FILE):
+    print(f"Error: Neighbor file not found at '{NEIGHBOR_FILE}'")
+    print("Please run 'python scripts/generate_neighbors.py' first.")
+    sys.exit(1)
+# ---------------------
+
+
+# 1. --- Load all components ---
+print("--- Loading all data and model components ---")
 args = read_args()
 args.use_vae_encoder = True
 args.use_skip_connection = True
 args.use_node_isolation = True
-args.use_concat_bilinear = True
-args.use_rw_loss = True
-args.embed_d = 256
-
-# Load data
-dataset = PRELUDEDataset("data/processed")
-generator = DataGenerator("data/processed")
-
-# After loading dataset but before model initialization
-print(f"Cell feature dimension: {dataset.cell_features_raw.shape[1]}")
-print(f"VAE expected dimension: {args.vae_dims.split(',')[0]}")
-assert dataset.cell_features_raw.shape[1] == int(args.vae_dims.split(',')[0]), \
-       f"VAE dimension mismatch! {dataset.cell_features_raw.shape[1]} vs {int(args.vae_dims.split(',')[0])}"
-
-# Print relation types for verification
-print("\nRelation types in dataset:")
-for rt, meta in dataset.info['link.dat'].items():
-    print(f"Type {rt}: {meta[3]} edges ({meta[0]}→{meta[1]})")
-
-# Device
+args.embed_d = 256 # Match VAE latent dim
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Model
-print("\nInitializing HetAgg model...")
-model = HetAgg(args, dataset, device).to(device)
+dataset = PRELUDEDataset("data/processed")
+feature_loader = FeatureLoader(dataset, device)
+generator = DataGenerator("data/processed").load_train_neighbors(NEIGHBOR_FILE)
+
+model = HetAgg(args, dataset, feature_loader, device).to(device)
 model.setup_link_prediction(drug_type_name="drug", cell_type_name="cell")
+print("All components loaded and initialized successfully.\n")
 
-# --- Filter for valid cells with VAE features ---
-valid_cell_ids = dataset.valid_cell_ids
-valid_cell_names = [dataset.id2node[gid] for gid in valid_cell_ids]
-print(f"\nNumber of valid cells: {len(valid_cell_names)}")
-print(f"Sample valid cell names: {valid_cell_names[:5]}")
 
-# Get filtered link prediction samples - USE RELATION TYPE 0 FOR CELL-DRUG
-all_pos = generator.get_positive_pairs(0)  # Correct relation type for cell-drug
+# 2. --- Test Link Prediction ---
+print("--- Testing Link Prediction (Relation Type 0: cell -> drug) ---")
+# Use the generator to get sample pairs
 generator.build_edge_set()
-all_neg = generator.sample_negative_pairs(0, num_samples=100)  # Same type
+pos_pairs = generator.get_positive_pairs(0)
+neg_pairs = generator.sample_negative_pairs(0, num_samples=2)
 
-# Print sample pairs for verification
-print(f"\nFirst 5 cell-drug pairs (global IDs): {all_pos[:5]}")
-print(f"First 5 cell names in pairs: {[dataset.id2node[p[0]] for p in all_pos[:5]]}")
-print(f"First 5 drug names in pairs: {[dataset.id2node[p[1]] for p in all_pos[:5]]}")
+# Prepare batch
+cell_gids = [pos_pairs[0][0], neg_pairs[0][0]]
+drug_gids = [pos_pairs[0][1], neg_pairs[0][1]]
+labels = torch.tensor([1.0, 0.0], device=device)
 
-# Convert global IDs to cell names for filtering
-def global_id_to_name(global_id):
-    return dataset.id2node.get(global_id, "UNKNOWN")
+# Convert global IDs to local IDs for the model
+cell_lids = [dataset.nodes['type_map'][gid][1] for gid in cell_gids]
+drug_lids = [dataset.nodes['type_map'][gid][1] for gid in drug_gids]
 
-filtered_pos = [
-    pair for pair in all_pos 
-    if global_id_to_name(pair[0]) in valid_cell_names
-]
+# --- Forward Pass ---
+print("  > Running link_prediction_forward...")
+model.eval()
+with torch.no_grad():
+    scores = model.link_prediction_forward(drug_lids, cell_lids, generator)
+print(f"    Scores: {scores.cpu().numpy()}")
+print("Forward pass complete.")
 
-filtered_neg = [
-    pair for pair in all_neg 
-    if global_id_to_name(pair[0]) in valid_cell_names
-]
+# --- Loss Calculation ---
+print("  > Running link_prediction_loss...")
+model.train()
+loss = model.link_prediction_loss(drug_lids, cell_lids, labels, generator, isolation_ratio=0.5)
+print(f"    Loss: {loss.item():.4f}")
+print("Loss calculation complete.\n")
 
-# Add after generating filtered_pos/filtered_neg
-print(f"\nTotal positive pairs: {len(all_pos)}")
-print(f"Valid positive pairs: {len(filtered_pos)}")
-print(f"Total negative pairs: {len(all_neg)}")
-print(f"Valid negative pairs: {len(filtered_neg)}")
 
-if not filtered_pos or not filtered_neg:
-    print("\nWarning: Using first positive/negative pairs without filtering")
-    filtered_pos = all_pos[:2]
-    filtered_neg = all_neg[:2]
-    print(f"Using filtered_pos: {filtered_pos}")
-    print(f"Using filtered_neg: {filtered_neg}")
+# 3. --- Test Self-Supervised RW Loss ---
+print("--- Testing Self-Supervised RW Loss ---")
+print("  > Generating RW triples...")
+rw_pairs = generator.generate_rw_triples(walk_length=5, window_size=2, num_walks=1)
 
-pos_pair = filtered_pos[0]
-neg_pair = filtered_neg[0]
+if rw_pairs:
+    # Get all node IDs to sample from for true negatives
+    all_node_ids = list(dataset.id2node.keys())
+    
+    # Create a batch of (center, positive, negative) triples with global IDs
+    rw_batch = []
+    for center, pos in rw_pairs[:10]: # Test with 10 triples
+        neg = random.choice(all_node_ids)
+        # Ensure negative sample is not the same as positive
+        while neg == pos:
+            neg = random.choice(all_node_ids)
+        rw_batch.append((center, pos, neg))
+    
+    print(f"  > Testing with a batch of {len(rw_batch)} triples...")
+    rw_loss = model.self_supervised_rw_loss(rw_batch, generator)
+    print(f"    RW Loss: {rw_loss.item():.4f}")
+    print("Self-supervised loss calculation complete.")
+else:
+    print("No random walk triples were generated, skipping test.")
 
-# Format input tensors
-cell_ids = torch.tensor([pos_pair[0], neg_pair[0]], dtype=torch.long).to(device)
-drug_ids = torch.tensor([pos_pair[1], neg_pair[1]], dtype=torch.long).to(device)
-labels = torch.tensor([1, 0], dtype=torch.float).to(device)
-
-# --- Forward pass + loss ---
-print("\n🔁 Running link prediction forward pass...")
-scores = model.link_prediction_forward(drug_ids, cell_ids)
-print(f"Scores: {scores.detach().cpu().numpy()}")
-
-print("\n🎯 Running link prediction loss...")
-loss = model.link_prediction_loss(drug_ids, cell_ids, labels, isolation_ratio=0.2)
-print(f"Link Prediction Loss: {loss.item():.4f}")
-
-# --- Optional: RW loss ---
-if args.use_rw_loss:
-    print("\n🔀 Running self-supervised RW loss test...")
-    rw_triples = generator.generate_rw_triples(walk_length=10, window_size=2, num_walks=2)
-    if rw_triples:
-        rw_loss = model.self_supervised_rw_loss([(t[0], t[1], t[1]) for t in rw_triples[:10]])  # dummy neg=pos
-        print(f"RW Loss: {rw_loss.item():.4f}")
-    else:
-        print("No RW triples generated.")
+print("\nAll tests passed!")
