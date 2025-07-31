@@ -1,3 +1,18 @@
+# Python
 __pycache__/
 *.pyc
-*.pkl
+*.pyo
+*.pyd
+
+# Environment
+hgb_env/
+venv/
+env/
+
+# Data and Model Assets
+# Do not track large data, embeddings, or generated graph files
+data/embeddings/
+data/processed/
+
+# OS-specific
+.DS_Store
