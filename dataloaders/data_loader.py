@@ -136,18 +136,18 @@ class PRELUDEDataset:
         print("Cell feature loading complete.\n")
 
     def summary(self):
-        print(f"🧬 Nodes: {len(self.node2id)}")
+        print(f"Nodes: {len(self.node2id)}")
         for ntype_id_str, meta in self.info['node.dat'].items():
             ntype_id = int(ntype_id_str)
             label = self.node_type2name.get(ntype_id, meta[0])
             count = self.nodes['count'].get(ntype_id, meta[1])
             print(f"  • Type {ntype_id} ({label}): {count}")
-        print(f"\n🔗 Links:")
+        print(f"\nLinks:")
         for ltype_id_str, meta in self.info['link.dat'].items():
             ltype_id = int(ltype_id_str)
             num_edges = len(self.links['data'].get(ltype_id, []))
             print(f"  • Type {ltype_id}: {meta[2]} — {num_edges} edges")
         if self.links['test']:
-            print(f"\n🧪 Test Links:")
+            print(f"\nTest Links:")
             for ltype_id, edges in self.links['test'].items():
                 print(f"  • Type {ltype_id}: {len(edges)} edges")

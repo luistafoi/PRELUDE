@@ -46,9 +46,9 @@ class HetAgg(nn.Module):
             full_vae = CellLineVAE(vae_dims).to(device)
             if os.path.exists(args.vae_checkpoint):
                 full_vae.load_state_dict(torch.load(args.vae_checkpoint, weights_only=True))
-                print(f"  ✅ Loaded VAE weights from: {args.vae_checkpoint}")
+                print(f"Loaded VAE weights from: {args.vae_checkpoint}")
             else:
-                print(f"  ⚠️ VAE weights not found at {args.vae_checkpoint}. Using random init.")
+                print(f"VAE weights not found at {args.vae_checkpoint}. Using random init.")
             self.cell_encoder = full_vae.encoder
         else: # Fallback to a simple embedding if not using VAE
             num_cells = self.dataset.nodes['count'][cell_type_id]

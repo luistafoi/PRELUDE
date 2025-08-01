@@ -25,7 +25,7 @@ dataset = PRELUDEDataset("data/processed")
 feature_loader = FeatureLoader(dataset, device)
 generator = DataGenerator("data/processed")
 model = HetAgg(args, dataset, feature_loader, device).to(device)
-print("✅ All components loaded.\n")
+print("All components loaded.\n")
 
 # --- 2. Test Node Initialization ---
 print("--- Part 1: Verifying Initial Node Features ---")
@@ -49,12 +49,12 @@ for name, type_id in node_types_to_test.items():
     with torch.no_grad():
         features = model.conteng_agg(sample_lids, type_id)
     
-    print(f"🧪 Testing '{name}' nodes...")
+    print(f"Testing '{name}' nodes...")
     print(f"  - Requested {len(sample_lids)} feature vectors.")
     print(f"  - Received tensor of shape: {features.shape}")
     assert features.shape == (len(sample_lids), args.embed_d)
     assert features.sum() != 0
-    print(f"  ✅ '{name}' nodes are being initialized correctly.\n")
+    print(f"'{name}' nodes are being initialized correctly.\n")
     
 # --- 3. Test Random Walk Composition ---
 print("--- Part 2: Analyzing Random Walk Composition ---")
@@ -99,12 +99,12 @@ for walk in walks:
                dataset.nodes['type_map'][node_gid][0] == gene_type_id:
                 gene_gene_steps += 1
                 
-print("\n🔎 Analysis Results:")
+print("\nAnalysis Results:")
 print(f"  - Total gene nodes found across all walks: {gene_nodes_in_walks}")
 print(f"  - Total gene-gene steps taken in walks: {gene_gene_steps}")
 
 assert gene_nodes_in_walks > 0, "No gene nodes were found in the random walks!"
 assert gene_gene_steps > 0, "No gene-gene links were traversed in the random walks!"
-print("  ✅ Random walks correctly include gene nodes and traverse gene-gene links.\n")
+print(" Random walks correctly include gene nodes and traverse gene-gene links.\n")
 
-print("🎉 All integrity tests passed!")
+print("All integrity tests passed!")
