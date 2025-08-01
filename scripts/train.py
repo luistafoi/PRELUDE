@@ -9,6 +9,7 @@ import numpy as np
 import random
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm 
+import csv
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -127,77 +128,93 @@ def main():
     best_valid_auc = 0.0
     patience_counter = 0
     save_path = os.path.join(args.save_dir, f"{args.model_name}.pth")
+    log_path = os.path.join(args.save_dir, f"{args.model_name}_log.csv")
 
-    print("\n--- Starting Model Training ---")
-    for epoch in range(args.epochs):
-        # --- ADD THIS PRINT STATEMENT ---
-        print(f"\nEpoch {epoch+1}/{args.epochs}")
-        model.train()
-        total_lp_loss = 0
-        total_rw_loss = 0
+    with open(log_path, 'w', newline='') as log_file:
+        csv_writer = csv.writer(log_file)
+        csv_writer.writerow(['epoch', 'lp_loss', 'rw_loss', 'val_auc'])
 
-        max_isolation_ratio = 0.2
-        current_isolation_ratio = max_isolation_ratio * (epoch / (args.epochs -1)) if args.epochs > 1 else 0
+        print("\n--- Starting Model Training ---")
 
-        # Phase 1: Supervised Link Prediction
-        # --- WRAP THE DATALOADER WITH TQDM ---
-        lp_iterator = tqdm(train_loader, desc="Phase 1: Link Prediction")
-        for u_gids, v_gids, labels in lp_iterator:
-            optimizer.zero_grad()
+        for epoch in range(args.epochs):
+            # --- ADD THIS PRINT STATEMENT ---
+            print(f"\nEpoch {epoch+1}/{args.epochs}")
+            model.train()
+            total_lp_loss = 0
+            total_rw_loss = 0
 
-            u_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in u_gids]
-            v_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in v_gids]
-            labels = labels.to(device)
+            max_isolation_ratio = 0.2
+            current_isolation_ratio = max_isolation_ratio * (epoch / (args.epochs -1)) if args.epochs > 1 else 0
 
-            u_type = dataset.nodes['type_map'][u_gids[0].item()][0]
-            drug_type_id = dataset.node_name2type['drug']
+            # Phase 1: Supervised Link Prediction
+            # --- WRAP THE DATALOADER WITH TQDM ---
+            lp_iterator = tqdm(train_loader, desc="Phase 1: Link Prediction")
+            for u_gids, v_gids, labels in lp_iterator:
+                optimizer.zero_grad()
 
-            if u_type == drug_type_id:
-                drug_lids, cell_lids = u_lids, v_lids
-            else:
-                drug_lids, cell_lids = v_lids, u_lids
+                u_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in u_gids]
+                v_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in v_gids]
+                labels = labels.to(device)
 
-            loss = model.link_prediction_loss(drug_lids, cell_lids, labels, generator, current_isolation_ratio)
-            loss.backward()
-            optimizer.step()
-            total_lp_loss += loss.item()
-            # --- ADD A LIVE LOSS UPDATE TO THE PROGRESS BAR ---
-            lp_iterator.set_postfix({"Loss": total_lp_loss / (lp_iterator.n + 1)})
+                u_type = dataset.nodes['type_map'][u_gids[0].item()][0]
+                drug_type_id = dataset.node_name2type['drug']
 
-        # Phase 2: Self-Supervised Random Walk
-        if args.use_rw_loss:
-            rw_pairs = generator.generate_rw_triples(walk_length=args.walk_length, window_size=args.window_size, num_walks=args.num_walks)
+                if u_type == drug_type_id:
+                    drug_lids, cell_lids = u_lids, v_lids
+                else:
+                    drug_lids, cell_lids = v_lids, u_lids
 
-            if rw_pairs:
-                all_node_ids = list(dataset.id2node.keys())
-                rw_batch = [(c, p, random.choice(all_node_ids)) for c, p in rw_pairs]
+                loss = model.link_prediction_loss(drug_lids, cell_lids, labels, generator, current_isolation_ratio)
+                loss.backward()
+                optimizer.step()
+                total_lp_loss += loss.item()
+                # --- ADD A LIVE LOSS UPDATE TO THE PROGRESS BAR ---
+                lp_iterator.set_postfix({"Loss": total_lp_loss / (lp_iterator.n + 1)})
 
-                rw_iterator = tqdm(range(0, len(rw_batch), args.mini_batch_s), desc="Phase 2: Random Walk")
-                for i in rw_iterator:
-                    optimizer.zero_grad()
-                    batch = rw_batch[i : i + args.mini_batch_s]
-                    if not batch: continue
-                    loss_rw = model.self_supervised_rw_loss(batch, generator)
-                    loss_rw.backward()
-                    optimizer.step()
-                    total_rw_loss += loss_rw.item()
-                    rw_iterator.set_postfix({"Loss": total_rw_loss / (rw_iterator.n + 1)})
+            # Phase 2: Self-Supervised Random Walk
+            if args.use_rw_loss:
+                rw_pairs = generator.generate_rw_triples(walk_length=args.walk_length, window_size=args.window_size, num_walks=args.num_walks)
 
-        # --- Validation & Early Stopping ---
-        if (epoch + 1) % args.val_freq == 0:
-            valid_auc = evaluate(model, valid_loader, generator, device, dataset)
-            print(f"  Validation AUC: {valid_auc:.4f}")
+                if rw_pairs:
+                    all_node_ids = list(dataset.id2node.keys())
+                    rw_batch = [(c, p, random.choice(all_node_ids)) for c, p in rw_pairs]
 
-            if valid_auc > best_valid_auc:
-                best_valid_auc = valid_auc
-                patience_counter = 0
-                torch.save(model.state_dict(), save_path)
-                print(f"New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
-            else:
-                patience_counter += 1
-                if patience_counter >= args.patience:
-                    print(f"  Stopping early as validation AUC has not improved for {patience_counter} checks.")
-                    break
+                    rw_iterator = tqdm(range(0, len(rw_batch), args.mini_batch_s), desc="Phase 2: Random Walk")
+                    for i in rw_iterator:
+                        optimizer.zero_grad()
+                        batch = rw_batch[i : i + args.mini_batch_s]
+                        if not batch: continue
+                        loss_rw = model.self_supervised_rw_loss(batch, generator)
+                        loss_rw.backward()
+                        optimizer.step()
+                        total_rw_loss += loss_rw.item()
+                        rw_iterator.set_postfix({"Loss": total_rw_loss / (rw_iterator.n + 1)})
+
+            avg_lp_loss = total_lp_loss / len(train_loader) if train_loader else 0
+            avg_rw_loss = 0
+            if args.use_rw_loss and rw_pairs:
+                num_rw_batches = (len(rw_batch) + args.mini_batch_s - 1) // args.mini_batch_s
+                avg_rw_loss = total_rw_loss / num_rw_batches if num_rw_batches > 0 else 0
+
+            # --- Validation & Early Stopping ---
+            valid_auc_epoch = np.nan
+            if (epoch + 1) % args.val_freq == 0:
+                valid_auc_epoch = evaluate(model, valid_loader, generator, device, dataset)
+                print(f"  Validation AUC: {valid_auc_epoch:.4f}")
+
+                if valid_auc_epoch > best_valid_auc:
+                    best_valid_auc = valid_auc_epoch
+                    patience_counter = 0
+                    torch.save(model.state_dict(), save_path)
+                    print(f"New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= args.patience:
+                        print(f"  Stopping early as validation AUC has not improved for {patience_counter} checks.")
+                        csv_writer.writerow([epoch + 1, avg_lp_loss, avg_rw_loss, valid_auc_epoch])
+                        break
+
+            csv_writer.writerow([epoch + 1, avg_lp_loss, avg_rw_loss, valid_auc_epoch])
 
     print("\n--- Training Complete ---")
     print(f"Best validation AUC: {best_valid_auc:.4f}")

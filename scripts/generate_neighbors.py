@@ -38,4 +38,4 @@ if __name__ == "__main__":
     # Run the generation process
     generator.gen_train_neighbors_with_restart(OUTPUT_FILE, NUM_SAMPLES_PER_TYPE)
     
-    print(f"\n✅ Generation complete. Neighbor list saved to {OUTPUT_FILE}.")
+    print(f"\nGeneration complete. Neighbor list saved to {OUTPUT_FILE}.")
