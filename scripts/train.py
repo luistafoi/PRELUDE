@@ -82,7 +82,7 @@ def main():
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # --- Load Components ---
@@ -192,7 +192,7 @@ def main():
                 best_valid_auc = valid_auc
                 patience_counter = 0
                 torch.save(model.state_dict(), save_path)
-                print(f"  ✨ New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
+                print(f"New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:

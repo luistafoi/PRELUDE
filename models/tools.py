@@ -93,9 +93,28 @@ class HetAgg(nn.Module):
 
         if self.args.use_vae_encoder and node_type == cell_type_id:
             global_id_batch = [self.dataset.local_to_global_map[node_type][lid] for lid in local_id_batch]
-            feature_indices = [self.dataset.cell_global_id_to_feature_idx[gid] for gid in global_id_batch]
-            raw_features = self.dataset.cell_features_raw[feature_indices].to(self.device)
-            return self.cell_encoder(raw_features)
+            
+            # Prepare a tensor to hold the final embeddings for the whole batch
+            final_encoded_features = torch.zeros(len(local_id_batch), self.embed_d, device=self.device)
+            
+            # Identify which cells in the batch are valid (have features)
+            valid_gids = []
+            original_indices = []
+            for i, gid in enumerate(global_id_batch):
+                if gid in self.dataset.cell_global_id_to_feature_idx:
+                    valid_gids.append(gid)
+                    original_indices.append(i)
+            
+            # If any valid cells were found, get their features and encode them
+            if valid_gids:
+                feature_indices = [self.dataset.cell_global_id_to_feature_idx[gid] for gid in valid_gids]
+                raw_features = self.dataset.cell_features_raw[feature_indices].to(self.device)
+                encoded_features = self.cell_encoder(raw_features)
+                
+                # Place the encoded features into the correct positions in the final tensor
+                final_encoded_features[original_indices] = encoded_features
+            
+            return final_encoded_features
         
         elif node_type == self.dataset.node_name2type['drug']:
             raw_features = self.feature_loader.drug_features[local_id_batch]

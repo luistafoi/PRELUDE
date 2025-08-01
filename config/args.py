@@ -12,6 +12,8 @@ def read_args():
                         help='Name for the saved model file (e.g., my_experiment).')
     parser.add_argument('--load_path', type=str, default='',
                         help='Full path to a saved model checkpoint to load for evaluation.')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU device ID to use.')
 
     # --- Model Architecture Arguments ---
     parser.add_argument('--embed_d', type=int, default=256,
@@ -20,7 +22,7 @@ def read_args():
                         help='Number of GNN layers.')
 
     # --- Training Arguments ---
-    parser.add_argument('--epochs', type=int, default=10,
+    parser.add_argument('--epochs', type=int, default=150,
                         help='Maximum number of training epochs.')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate.')
