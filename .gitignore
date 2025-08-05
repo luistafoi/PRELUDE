@@ -11,3 +11,6 @@ env/
 
 # OS-specific
 .DS_Store
+
+# Model checkpoints and logs
+checkpoints/
