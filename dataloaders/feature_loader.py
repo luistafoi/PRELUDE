@@ -19,6 +19,8 @@ class FeatureLoader:
         
         self.drug_features = self._load_drug_features().to(self.device)
         self.gene_features = self._load_gene_features().to(self.device)
+        self.cell_features = self._load_cell_features().to(self.device)
+
         print("FeatureLoader initialization complete.")
 
     def _load_drug_features(self):
@@ -86,3 +88,33 @@ class FeatureLoader:
         
         print(f"  > Loaded aligned gene features tensor: {aligned_gene_feats.shape}")
         return aligned_gene_feats
+    
+    def _load_cell_features(self):
+        """
+        Loads the pre-computed VAE embeddings from the .npy file.
+        This is used for the 'use_static_cell_embeddings' mode.
+        """
+        cell_type_id = self.dataset.node_name2type["cell"]
+        num_cells = self.dataset.nodes['count'][cell_type_id]
+        path = "data/embeddings/final_vae_cell_embeddings.npy"
+        
+        if not os.path.exists(path):
+            print(f"  > Warning: Pre-computed cell embeddings not found at {path}. Returning zero tensor.")
+            # Return a zero tensor with the expected output dimension (e.g., 256)
+            return torch.zeros(num_cells, 256, dtype=torch.float32)
+
+        vae_embeds = np.load(path)
+        feature_dim = vae_embeds.shape[1]
+        
+        aligned_cell_feats = torch.zeros(num_cells, feature_dim, dtype=torch.float32)
+        
+        # This mapping assumes the order in vae_embeds corresponds to the order in dataset.valid_cell_local_ids
+        if len(self.dataset.valid_cell_local_ids) == len(vae_embeds):
+            for i, local_id in enumerate(self.dataset.valid_cell_local_ids):
+                if local_id < num_cells:
+                    aligned_cell_feats[local_id] = torch.from_numpy(vae_embeds[i])
+        else:
+            print("  > Warning: Mismatch between number of VAE embeddings and valid cells. Static features may be incorrect.")
+
+        print(f"  > Loaded static cell features tensor: {aligned_cell_feats.shape}")
+        return aligned_cell_feats

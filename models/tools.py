@@ -39,18 +39,23 @@ class HetAgg(nn.Module):
         gene_feat_dim = self.feature_loader.gene_features.shape[1]
         self.feat_proj[str(gene_type_id)] = nn.Linear(gene_feat_dim, self.embed_d).to(device)
 
-        # For cells, we use the VAE encoder
+        # For cells, we use the VAE encoder, feature handling depends on the chosen mode
         if args.use_vae_encoder:
-            print("INFO: Initializing VAE encoder for cell features.")
+            print("INFO: Initializing VAE encoder for DYNAMIC cell features.")
             vae_dims = list(map(int, args.vae_dims.split(',')))
             full_vae = CellLineVAE(vae_dims).to(device)
             if os.path.exists(args.vae_checkpoint):
                 full_vae.load_state_dict(torch.load(args.vae_checkpoint, weights_only=True))
-                print(f"Loaded VAE weights from: {args.vae_checkpoint}")
-            else:
-                print(f"VAE weights not found at {args.vae_checkpoint}. Using random init.")
+                print(f" Loaded VAE weights from: {args.vae_checkpoint}")
             self.cell_encoder = full_vae.encoder
-        else: # Fallback to a simple embedding if not using VAE
+        
+        elif args.use_static_cell_embeddings:
+            print("INFO: Using STATIC pre-computed VAE embeddings for cell features.")
+            cell_feat_dim = self.feature_loader.cell_features.shape[1]
+            self.feat_proj[str(cell_type_id)] = nn.Linear(cell_feat_dim, self.embed_d).to(device)
+
+        else: # Default 'random' mode
+            print("INFO: Using learnable nn.Embedding for RANDOM cell features.")
             num_cells = self.dataset.nodes['count'][cell_type_id]
             self.feat_proj[str(cell_type_id)] = nn.Embedding(num_cells, self.embed_d).to(device)
 
@@ -91,31 +96,41 @@ class HetAgg(nn.Module):
             
         cell_type_id = self.dataset.node_name2type['cell']
 
-        if self.args.use_vae_encoder and node_type == cell_type_id:
-            global_id_batch = [self.dataset.local_to_global_map[node_type][lid] for lid in local_id_batch]
-            
-            # Prepare a tensor to hold the final embeddings for the whole batch
-            final_encoded_features = torch.zeros(len(local_id_batch), self.embed_d, device=self.device)
-            
-            # Identify which cells in the batch are valid (have features)
-            valid_gids = []
-            original_indices = []
-            for i, gid in enumerate(global_id_batch):
-                if gid in self.dataset.cell_global_id_to_feature_idx:
-                    valid_gids.append(gid)
-                    original_indices.append(i)
-            
-            # If any valid cells were found, get their features and encode them
-            if valid_gids:
-                feature_indices = [self.dataset.cell_global_id_to_feature_idx[gid] for gid in valid_gids]
-                raw_features = self.dataset.cell_features_raw[feature_indices].to(self.device)
-                encoded_features = self.cell_encoder(raw_features)
+        # --- This is the main block for cell feature logic ---
+        if node_type == cell_type_id:
+            if self.args.use_vae_encoder:
+                # Mode 1: Dynamic VAE (slower)
+                # Runs the VAE encoder on-the-fly for the batch.
+                global_id_batch = [self.dataset.local_to_global_map[node_type][lid] for lid in local_id_batch]
+                final_encoded_features = torch.zeros(len(local_id_batch), self.embed_d, device=self.device)
                 
-                # Place the encoded features into the correct positions in the final tensor
-                final_encoded_features[original_indices] = encoded_features
+                valid_gids, original_indices = [], []
+                for i, gid in enumerate(global_id_batch):
+                    if gid in self.dataset.cell_global_id_to_feature_idx:
+                        valid_gids.append(gid)
+                        original_indices.append(i)
+                
+                if valid_gids:
+                    feature_indices = [self.dataset.cell_global_id_to_feature_idx[gid] for gid in valid_gids]
+                    raw_features = self.dataset.cell_features_raw[feature_indices].to(self.device)
+                    encoded_features = self.cell_encoder(raw_features)
+                    final_encoded_features[original_indices] = encoded_features
+                
+                return final_encoded_features
+
+            elif self.args.use_static_cell_embeddings:
+                # Mode 2: Static VAE (faster)
+                # Looks up pre-computed embeddings from the FeatureLoader and projects them.
+                raw_features = self.feature_loader.cell_features[local_id_batch]
+                return self.feat_proj[str(node_type)](raw_features)
             
-            return final_encoded_features
+            else: 
+                # Mode 3: Default 'random' mode
+                # Uses a standard, learnable nn.Embedding layer.
+                local_indices_tensor = torch.LongTensor(local_id_batch).to(self.device)
+                return self.feat_proj[str(node_type)](local_indices_tensor)
         
+        # --- Logic for Drug and Gene Features (this part is the same for all modes) ---
         elif node_type == self.dataset.node_name2type['drug']:
             raw_features = self.feature_loader.drug_features[local_id_batch]
             return self.feat_proj[str(node_type)](raw_features)
@@ -123,10 +138,6 @@ class HetAgg(nn.Module):
         elif node_type == self.dataset.node_name2type['gene']:
             raw_features = self.feature_loader.gene_features[local_id_batch]
             return self.feat_proj[str(node_type)](raw_features)
-
-        else: # Fallback for cells if not using VAE, or other types
-            local_indices_tensor = torch.LongTensor(local_id_batch).to(self.device)
-            return self.feat_proj[str(node_type)](local_indices_tensor)
 
     def node_het_agg(self, id_batch_local, node_type, data_generator: DataGenerator):
         """Performs full GNN message passing using the pre-generated neighbor list."""
