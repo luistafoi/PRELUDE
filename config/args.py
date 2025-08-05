@@ -49,6 +49,10 @@ def read_args():
                         help='Path to trained VAE weights.')
     parser.add_argument('--vae_dims', type=str, default='19193,10000,5000,1000,500,256',
                         help='Comma-separated dims for VAE layers.')
+    parser.add_argument('--use_lp_curriculum', action='store_true',
+                        help='Enable curriculum learning for the LP loss weight.')
+    parser.add_argument('--lp_loss_lambda', type=float, default=10.0,
+                        help='The maximum weight for the LP loss when curriculum is enabled.')
 
     # --- Random Walk (for self-supervised loss) ---
     parser.add_argument('--walk_length', type=int, default=10, help='Length of each random walk.')

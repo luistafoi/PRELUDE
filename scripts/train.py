@@ -24,7 +24,6 @@ from models.tools import HetAgg
 class LinkPredictionDataset(Dataset):
     """Custom Dataset for link prediction to handle large numbers of links."""
     def __init__(self, pos_links, neg_links):
-        # pos_links and neg_links are lists of (u_gid, v_gid) tuples
         u_nodes = [p[0] for p in pos_links] + [n[0] for n in neg_links]
         v_nodes = [p[1] for p in pos_links] + [n[1] for n in neg_links]
         labels = [1.0] * len(pos_links) + [0.0] * len(neg_links)
@@ -48,13 +47,10 @@ def evaluate(model, dataloader, generator, device, dataset):
     
     with torch.no_grad():
         for u_gids_batch, v_gids_batch, labels_batch in dataloader:
-            # Convert global IDs to local IDs for the model
             u_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in u_gids_batch]
             v_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in v_gids_batch]
             
-            # The model's forward pass expects (drug, cell), determine which is which
             u_type = dataset.nodes['type_map'][u_gids_batch[0].item()][0]
-            v_type = dataset.nodes['type_map'][v_gids_batch[0].item()][0]
             drug_type_id = dataset.node_name2type['drug']
 
             if u_type == drug_type_id:
@@ -101,25 +97,17 @@ def main():
     model.setup_link_prediction(drug_type_name="drug", cell_type_name="cell")
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # --- Prepare DataLoaders ---
-    lp_relation_type = 0 
-    generator.build_edge_set()
-
-    print("\nFiltering training and validation links for valid cells...")
-    valid_cell_gids = dataset.valid_cell_ids
-
-    all_train_pos = [(e[0], e[1]) for e in dataset.links['train'][lp_relation_type]]
-    train_pos = [pair for pair in all_train_pos if pair[0] in valid_cell_gids]
-    all_train_neg = generator.sample_negative_pairs(lp_relation_type, num_samples=len(train_pos))
-    train_neg = [pair for pair in all_train_neg if pair[0] in valid_cell_gids]
+    # --- Prepare DataLoaders using pre-defined splits ---
+    print("\nLoading pre-split and GMM-filtered training/validation data...")
+    
+    train_pos = dataset.links['train_pos']
+    train_neg = dataset.links['train_neg']
     train_dataset = LinkPredictionDataset(train_pos, train_neg)
     train_loader = DataLoader(train_dataset, batch_size=args.mini_batch_s, shuffle=True)
     print(f"  > Created training loader with {len(train_pos)} positive and {len(train_neg)} negative pairs.")
-
-    all_valid_pos = [(e[0], e[1]) for e in dataset.links['valid'][lp_relation_type]]
-    valid_pos = [pair for pair in all_valid_pos if pair[0] in valid_cell_gids]
-    all_valid_neg = generator.sample_negative_pairs(lp_relation_type, num_samples=len(valid_pos))
-    valid_neg = [pair for pair in all_valid_neg if pair[0] in valid_cell_gids]
+    
+    valid_pos = dataset.links['valid_pos']
+    valid_neg = dataset.links['valid_neg']
     valid_dataset = LinkPredictionDataset(valid_pos, valid_neg)
     valid_loader = DataLoader(valid_dataset, batch_size=args.mini_batch_s)
     print(f"  > Created validation loader with {len(valid_pos)} positive and {len(valid_neg)} negative pairs.")
@@ -137,17 +125,22 @@ def main():
         print("\n--- Starting Model Training ---")
 
         for epoch in range(args.epochs):
-            # --- ADD THIS PRINT STATEMENT ---
             print(f"\nEpoch {epoch+1}/{args.epochs}")
             model.train()
             total_lp_loss = 0
             total_rw_loss = 0
 
+            # Curriculum learning for node isolation
             max_isolation_ratio = 0.2
             current_isolation_ratio = max_isolation_ratio * (epoch / (args.epochs -1)) if args.epochs > 1 else 0
+            
+            # Curriculum learning for LP loss weight
+            current_lambda = 1.0
+            if args.use_lp_curriculum:
+                max_lambda = args.lp_loss_lambda
+                current_lambda = max_lambda * (epoch / (args.epochs - 1)) if args.epochs > 1 else max_lambda
 
             # Phase 1: Supervised Link Prediction
-            # --- WRAP THE DATALOADER WITH TQDM ---
             lp_iterator = tqdm(train_loader, desc="Phase 1: Link Prediction")
             for u_gids, v_gids, labels in lp_iterator:
                 optimizer.zero_grad()
@@ -165,10 +158,12 @@ def main():
                     drug_lids, cell_lids = v_lids, u_lids
 
                 loss = model.link_prediction_loss(drug_lids, cell_lids, labels, generator, current_isolation_ratio)
-                loss.backward()
+                
+                weighted_loss = current_lambda * loss
+                weighted_loss.backward()
+                
                 optimizer.step()
                 total_lp_loss += loss.item()
-                # --- ADD A LIVE LOSS UPDATE TO THE PROGRESS BAR ---
                 lp_iterator.set_postfix({"Loss": total_lp_loss / (lp_iterator.n + 1)})
 
             # Phase 2: Self-Supervised Random Walk
@@ -206,7 +201,7 @@ def main():
                     best_valid_auc = valid_auc_epoch
                     patience_counter = 0
                     torch.save(model.state_dict(), save_path)
-                    print(f"New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
+                    print(f"  ✨ New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
                 else:
                     patience_counter += 1
                     if patience_counter >= args.patience:

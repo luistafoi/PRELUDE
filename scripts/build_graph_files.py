@@ -1,108 +1,145 @@
 # scripts/build_graph_files.py
 
 """
-Graph Construction Script for the PRELUDE Project.
-
-This script reads a cleaned and unified file of interactions and converts
-it into the .dat graph format required by the model. It creates a `node.dat`
-file with unique IDs for all entities (cells, drugs, genes) and a `link.dat`
-file that represents the connections between them.
-
-Example usage:
-    python scripts/build_graph_files.py \
-        --interactions-file data/processed/cleaned_interactions.csv \
-        --output-dir data/processed
+Constructs the final graph files (node.dat, link.dat, info.dat) and a node
+mapping file, following the proven single-pass logic from the source notebook.
 """
-
 import pandas as pd
-import argparse
+import json
+from collections import defaultdict
+from tqdm import tqdm
 import os
-
-def create_node_mappings(df: pd.DataFrame) -> tuple:
-    """Creates unique integer IDs for all nodes."""
-    print("Creating node mappings...")
-    cells = pd.unique(df['cell_line_name'])
-    drugs = pd.unique(df[df['interaction_type'] == 'cell_drug']['target_name'])
-    genes = pd.unique(df[df['interaction_type'] == 'cell_gene']['target_name'])
-    
-    node_to_id = {}
-    node_to_type = {}
-    
-    # Assign IDs and types: cell=0, drug=1, gene=2
-    for node in cells:
-        if node not in node_to_id:
-            node_to_id[node] = len(node_to_id)
-            node_to_type[node] = 0
-    for node in drugs:
-        if node not in node_to_id:
-            node_to_id[node] = len(node_to_id)
-            node_to_type[node] = 1
-    for node in genes:
-        if node not in node_to_id:
-            node_to_id[node] = len(node_to_id)
-            node_to_type[node] = 2
-            
-    print(f"  > Mapped {len(node_to_id)} unique nodes.")
-    return node_to_id, node_to_type
-
-def write_node_dat(node_to_id: dict, node_to_type: dict, output_path: str):
-    """Writes the node.dat file."""
-    print(f"Writing node data to {output_path}...")
-    with open(output_path, 'w') as f:
-        # Sort by ID for consistency
-        sorted_nodes = sorted(node_to_id.items(), key=lambda item: item[1])
-        for name, uid in sorted_nodes:
-            ntype = node_to_type[name]
-            f.write(f"{uid}\t{name}\t{ntype}\n")
-
-def write_link_dat(df: pd.DataFrame, node_to_id: dict, output_path: str):
-    """Writes the link.dat file."""
-    print(f"Writing link data to {output_path}...")
-    # Define link types based on the interaction pairs
-    link_type_map = {
-        ('cell', 'drug'): 0,
-        ('cell', 'gene'): 1
-        # Add other types like ('gene', 'drug'): 2, etc. if they exist
-    }
-    
-    with open(output_path, 'w') as f:
-        for _, row in df.iterrows():
-            source_name = row['cell_line_name']
-            target_name = row['target_name']
-            
-            source_id = node_to_id.get(source_name)
-            target_id = node_to_id.get(target_name)
-            
-            if source_id is None or target_id is None:
-                continue
-
-            # Determine link type (e.g., cell_drug -> (cell, drug))
-            interaction = tuple(row['interaction_type'].split('_'))
-            link_type = link_type_map.get(interaction)
-            
-            if link_type is not None:
-                f.write(f"{source_id}\t{target_id}\t{link_type}\t{row['weight']}\n")
+import argparse
 
 def main(args):
-    """Main execution function."""
-    df_interactions = pd.read_csv(args.interactions_file)
+    # --- Configuration: Define input files and node type mappings ---
+    link_paths = {
+        "cell-drug": args.cell_drug_file,
+        "gene-cell": os.path.join(args.raw_dir, "link_gene_cell.txt"),
+        "gene-drug": os.path.join(args.raw_dir, "link_gene_drug.txt"),
+        "gene-gene": os.path.join(args.raw_dir, "link_gene_gene.txt")
+    }
+
+    # Maps file key to (source_type_id, target_type_id, relation_name)
+    type_map = {
+        "cell-drug": (0, 1, "cell-drug_interaction"),
+        "gene-cell": (0, 2, "cell-gene_expression"),
+        "gene-drug": (2, 1, "gene-targeted_by_drug"),
+        "gene-gene": (2, 2, "gene-interacts_gene")
+    }
     
-    node_to_id, node_to_type = create_node_mappings(df_interactions)
-    
-    node_dat_path = os.path.join(args.output_dir, 'node.dat')
-    link_dat_path = os.path.join(args.output_dir, 'link.dat')
-    
+    # --- Initialization (as per the notebook) ---
+    node2id = {}
+    node_types = {}  # maps node name to its type id
+    next_id = 0
+
+    edges = []
+    link_info = {}
+    link_type_counter = 0
+
+    # --- Process all link files in a single pass ---
+    print("--- Building graph files from raw sources ---")
+    for name, path in link_paths.items():
+        if not os.path.exists(path):
+            print(f"  > Warning: File not found for {name} at {path}. Skipping.")
+            continue
+
+        print(f"  > Processing {name}...")
+        df = pd.read_csv(path, sep="\t", header=None, names=["src", "tgt", "type", "weight"])
+        src_type, tgt_type, relation_name = type_map[name]
+
+        # Clean strings
+        df["src"] = df["src"].astype(str).str.strip()
+        df["tgt"] = df["tgt"].astype(str).str.strip()
+
+        # Uppercase drug names only
+        if src_type == 1:
+            df["src"] = df["src"].str.upper()
+        if tgt_type == 1:
+            df["tgt"] = df["tgt"].str.upper()
+
+        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"  - {name}"):
+            src, tgt = row["src"], row["tgt"]
+
+            # Assign IDs and types if nodes are new
+            for node, ntype in [(src, src_type), (tgt, tgt_type)]:
+                if node not in node2id:
+                    node2id[node] = next_id
+                    node_types[node] = ntype
+                    next_id += 1
+
+            # Translate names to IDs for the edge
+            src_id = node2id[src]
+            tgt_id = node2id[tgt]
+            weight = row["weight"]
+
+            edges.append(f"{src_id}\t{tgt_id}\t{link_type_counter}\t{weight}")
+        
+        # Store metadata for info.dat
+        type_names = {0: "cell", 1: "drug", 2: "gene"}
+        link_info[str(link_type_counter)] = [ 
+            type_names[src_type],
+            type_names[tgt_type],
+            relation_name,
+            len(df)
+        ]
+        link_type_counter += 1
+
+    # --- Create output directory if it doesn't exist ---
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    write_node_dat(node_to_id, node_to_type, node_dat_path)
-    write_link_dat(df_interactions, node_to_id, link_dat_path)
-    
+
+    # --- Save node.dat ---
+    node_dat_path = os.path.join(args.output_dir, "node.dat")
+    with open(node_dat_path, "w") as f:
+        sorted_nodes = sorted(node2id.items(), key=lambda item: item[1])
+        for node, nid in sorted_nodes:
+            f.write(f"{nid}\t{node}\t{node_types[node]}\n")
+
+    # --- Save node_mappings.json ---
+    map_path = os.path.join(args.output_dir, "node_mappings.json")
+    with open(map_path, 'w') as f:
+        json.dump(node2id, f, indent=4)
+
+    # --- Save link.dat ---
+    link_dat_path = os.path.join(args.output_dir, "link.dat")
+    with open(link_dat_path, "w") as f:
+        f.write("\n".join(edges))
+
+    # --- Save info.dat ---
+    type_counts = defaultdict(int)
+    for ntype in node_types.values():
+        type_counts[ntype] += 1
+        
+    info = {
+        "dataset": "PRELUDE_CellDrugGene_Network",
+        "node.dat": {
+            "0": ["cell", type_counts[0]],
+            "1": ["drug", type_counts[1]],
+            "2": ["gene", type_counts[2]]
+        },
+        "link.dat": link_info
+    }
+    info_dat_path = os.path.join(args.output_dir, "info.dat")
+    with open(info_dat_path, "w") as f:
+        json.dump(info, f, indent=4)
+
+    # --- Summary ---
+    print("\n--- Summary ---")
+    print(f"  > Wrote {len(node2id)} nodes to {node_dat_path}")
+    print(f"  > Wrote mapping for {len(node2id)} nodes to {map_path}")
+    print(f"  > Wrote {len(edges)} links to {link_dat_path}")
+    print(f"  > Wrote metadata to {info_dat_path}")
     print("\nGraph construction complete.")
 
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Build graph .dat files from cleaned interactions.")
-    parser.add_argument('--interactions-file', required=True, help='Path to the cleaned interactions CSV file.')
-    parser.add_argument('--output-dir', default='data/processed', help='Directory to save the output .dat files.')
+    parser = argparse.ArgumentParser(description="Build graph .dat files from raw link files, following the proven notebook logic.")
+    parser.add_argument('--cell-drug-file', default='data/raw/link_cell_drug_labeled.txt',
+                        help='Path to the GMM-labeled cell-drug link file.')
+    parser.add_argument('--raw-dir', default='data/raw',
+                        help='Directory containing other raw link files (gene-gene, etc.).')
+    parser.add_argument('--output-dir', default='data/processed',
+                        help='Directory to save the output .dat files.')
     
     args = parser.parse_args()
     main(args)

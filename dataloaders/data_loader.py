@@ -6,16 +6,21 @@ import pandas as pd
 import numpy as np
 import torch
 from collections import defaultdict
-import random
 
 class PRELUDEDataset:
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self.info = self._load_info()
+        
+        # This dictionary will now hold the graph structure and the pre-split links
         self.links = {
-            'train': defaultdict(list), # Changed from 'data'
-            'valid': defaultdict(list), # Added validation set
-            'test': defaultdict(list)
+            'graph': defaultdict(list), # For GNN message passing (from train.dat)
+            'train_pos': [],
+            'train_neg': [],
+            'valid_pos': [],
+            'valid_neg': [],
+            'test_pos': [],
+            'test_neg': []
         }
 
         self._load_nodes()
@@ -35,24 +40,25 @@ class PRELUDEDataset:
             'type_map': dict(type_map)
         }
 
-        self._load_links()
-        self._load_test_links()
+        # Load all the different link files
+        self._load_graph_links()
+        self._load_lp_splits()
 
-        # Load cell features (now that self.nodes exists)
+        # Load cell features
         self.cell_features_raw = None
-        self.cell_global_id_to_feature_idx = None # Renamed for clarity
+        self.cell_global_id_to_feature_idx = None
         self._load_cell_features()
 
         self.node_name2type = {"cell": 0, "drug": 1, "gene": 2}
         self.node_type2name = {v: k for k, v in self.node_name2type.items()}
         
-        # Create a helper map for converting local IDs to global IDs
         self.local_to_global_map = {ntype: {} for ntype in self.nodes['count']}
         for global_id, (ntype, local_id) in self.nodes['type_map'].items():
             self.local_to_global_map[ntype][local_id] = global_id
 
     def _load_info(self):
         path = os.path.join(self.data_dir, 'info.dat')
+        if not os.path.exists(path): return {}
         with open(path, 'r') as f:
             return json.load(f)
 
@@ -70,37 +76,30 @@ class PRELUDEDataset:
                 self.id2node[nid] = name
                 self.node_types[nid] = ntype
 
-    def _load_links(self, val_split_ratio=0.1):
-        """
-        Loads links and splits them into training and validation sets.
-        """
-        path = os.path.join(self.data_dir, 'link.dat')
-        
-        # First, load all links grouped by type
-        all_links = defaultdict(list)
+    def _load_graph_links(self):
+        """Loads the structural links (from train.dat) for GNN message passing."""
+        path = os.path.join(self.data_dir, 'train.dat')
+        if not os.path.exists(path): return
         with open(path, 'r') as f:
             for line in f:
-                src, tgt, ltype, weight = line.strip().split('\t')
-                all_links[int(ltype)].append((int(src), int(tgt), float(weight)))
-        
-        # Now, split each type into train and validation
-        print("\nSplitting links into training and validation sets...")
-        for ltype, edges in all_links.items():
-            random.shuffle(edges)
-            split_idx = int(len(edges) * (1 - val_split_ratio))
-            self.links['train'][ltype] = edges[:split_idx]
-            self.links['valid'][ltype] = edges[split_idx:]
-            print(f"  - Link Type {ltype}: {len(self.links['train'][ltype])} train, {len(self.links['valid'][ltype])} valid")
+                parts = line.strip().split('\t')
+                if len(parts) < 4: continue
+                src, tgt, ltype, weight = parts
+                self.links['graph'][int(ltype)].append((int(src), int(tgt), float(weight)))
 
-
-    def _load_test_links(self):
-        path = os.path.join(self.data_dir, 'link.dat.test')
-        if not os.path.exists(path):
-            return
-        with open(path, 'r') as f:
-            for line in f:
-                src, tgt, ltype, weight = line.strip().split('\t')
-                self.links['test'][int(ltype)].append((int(src), int(tgt), float(weight)))
+    def _load_lp_splits(self):
+        """Loads all pre-split positive and negative link files."""
+        print("Loading pre-split link prediction data...")
+        split_names = ['train_pos', 'train_neg', 'valid_pos', 'valid_neg', 'test_pos', 'test_neg']
+        for split in split_names:
+            path = os.path.join(self.data_dir, f"{split}.dat")
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 2:
+                            self.links[split].append((int(parts[0]), int(parts[1])))
+            print(f"  > Loaded {len(self.links[split])} links for {split}")
 
     def _load_cell_features(self):
         print("\nLoading VAE-compatible raw cell expression features...")
@@ -108,7 +107,7 @@ class PRELUDEDataset:
 
         node_cells = {
             name.upper(): nid for nid, name in self.id2node.items()
-            if self.node_types[nid] == 0  # 0 = cell
+            if self.node_types[nid] == 0
         }
 
         df_expr = pd.read_csv(EXPRESSION_FILE)
@@ -136,18 +135,24 @@ class PRELUDEDataset:
         print("Cell feature loading complete.\n")
 
     def summary(self):
-        print(f"Nodes: {len(self.node2id)}")
-        for ntype_id_str, meta in self.info['node.dat'].items():
-            ntype_id = int(ntype_id_str)
-            label = self.node_type2name.get(ntype_id, meta[0])
-            count = self.nodes['count'].get(ntype_id, meta[1])
-            print(f"  • Type {ntype_id} ({label}): {count}")
-        print(f"\nLinks:")
-        for ltype_id_str, meta in self.info['link.dat'].items():
-            ltype_id = int(ltype_id_str)
-            num_edges = len(self.links['data'].get(ltype_id, []))
-            print(f"  • Type {ltype_id}: {meta[2]} — {num_edges} edges")
-        if self.links['test']:
-            print(f"\nTest Links:")
-            for ltype_id, edges in self.links['test'].items():
-                print(f"  • Type {ltype_id}: {len(edges)} edges")
+        """Prints a detailed summary of the loaded dataset."""
+        print("--- PRELUDE Dataset Summary ---")
+        print(f"\nNodes:")
+        for ntype_id, count in sorted(self.nodes['count'].items()):
+            ntype_name = self.node_type2name.get(ntype_id, f"Type {ntype_id}")
+            print(f"  - {ntype_name.capitalize()} (Type {ntype_id}): {count} nodes")
+
+        print(f"\nStructural Links (for GNN message passing from train.dat):")
+        total_graph_links = 0
+        for ltype, edges in sorted(self.links['graph'].items()):
+            # Get type names from info.dat if available
+            type_info = self.info.get('link.dat', {}).get(str(ltype), ["", "", f"Type {ltype}"])
+            print(f"  - {type_info[2]}: {len(edges)} edges")
+            total_graph_links += len(edges)
+        print(f"  > Total structural links for GNN: {total_graph_links}")
+
+        print(f"\nLink Prediction Pairs (GMM Labeled):")
+        print(f"  - Training Set:   {len(self.links['train_pos'])} positive, {len(self.links['train_neg'])} negative")
+        print(f"  - Validation Set: {len(self.links['valid_pos'])} positive, {len(self.links['valid_neg'])} negative")
+        print(f"  - Test Set:       {len(self.links['test_pos'])} positive, {len(self.links['test_neg'])} negative")
+        print("---------------------------------")
