@@ -13,4 +13,5 @@ env/
 .DS_Store
 
 # Model checkpoints and logs
-checkpoints/
+checkpoints/*
+!checkpoints/.gitkeep
