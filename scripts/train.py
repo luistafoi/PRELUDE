@@ -10,6 +10,7 @@ import random
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm 
 import csv
+from torch.utils.tensorboard import SummaryWriter
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -118,6 +119,9 @@ def main():
     save_path = os.path.join(args.save_dir, f"{args.model_name}.pth")
     log_path = os.path.join(args.save_dir, f"{args.model_name}_log.csv")
 
+    #Add TensorBoard logging
+    writer = SummaryWriter(log_dir=f'runs/{args.model_name}')
+
     with open(log_path, 'w', newline='') as log_file:
         csv_writer = csv.writer(log_file)
         csv_writer.writerow(['epoch', 'lp_loss', 'rw_loss', 'val_auc'])
@@ -201,16 +205,21 @@ def main():
                     best_valid_auc = valid_auc_epoch
                     patience_counter = 0
                     torch.save(model.state_dict(), save_path)
-                    print(f"  ✨ New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
+                    print(f"  New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
                 else:
                     patience_counter += 1
                     if patience_counter >= args.patience:
                         print(f"  Stopping early as validation AUC has not improved for {patience_counter} checks.")
                         csv_writer.writerow([epoch + 1, avg_lp_loss, avg_rw_loss, valid_auc_epoch])
-                        break
 
-            csv_writer.writerow([epoch + 1, avg_lp_loss, avg_rw_loss, valid_auc_epoch])
+            # Log scalars to TensorBoard
+            writer.add_scalar('Loss/Link_Prediction', avg_lp_loss, epoch + 1)
+            if args.use_rw_loss:
+                writer.add_scalar('Loss/Random_Walk', avg_rw_loss, epoch + 1)
+            if not np.isnan(valid_auc_epoch):
+                writer.add_scalar('AUC/Validation', valid_auc_epoch, epoch + 1)
 
+    writer.close()
     print("\n--- Training Complete ---")
     print(f"Best validation AUC: {best_valid_auc:.4f}")
 
