@@ -53,6 +53,9 @@ def read_args():
                         help='Enable curriculum learning for the LP loss weight.')
     parser.add_argument('--lp_loss_lambda', type=float, default=10.0,
                         help='The maximum weight for the LP loss when curriculum is enabled.')
+    parser.add_argument('--use_static_cell_embeddings', action='store_true',
+                        help='(Faster) Use pre-computed VAE embeddings from a file for cell feature.')
+
 
     # --- Random Walk (for self-supervised loss) ---
     parser.add_argument('--walk_length', type=int, default=10, help='Length of each random walk.')
