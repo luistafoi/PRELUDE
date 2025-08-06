@@ -15,3 +15,6 @@ env/
 # Model checkpoints and logs
 checkpoints/*
 !checkpoints/.gitkeep
+
+runs/*
+!runs/.gitkeep
