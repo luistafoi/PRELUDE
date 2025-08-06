@@ -7,7 +7,6 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import random
-from sklearn.metrics import roc_auc_score
 from tqdm import tqdm 
 import csv
 from torch.utils.tensorboard import SummaryWriter
@@ -20,6 +19,7 @@ from dataloaders.data_loader import PRELUDEDataset
 from dataloaders.data_generator import DataGenerator
 from dataloaders.feature_loader import FeatureLoader
 from models.tools import HetAgg
+from utils.evaluation import evaluate_model # <-- Import from the new utility file
 
 # --- Helper: Memory-Efficient Dataset for Link Prediction ---
 class LinkPredictionDataset(Dataset):
@@ -39,35 +39,7 @@ class LinkPredictionDataset(Dataset):
     def __getitem__(self, idx):
         return self.u_nodes[idx], self.v_nodes[idx], self.labels[idx]
 
-# --- Helper: Evaluation Function ---
-def evaluate(model, dataloader, generator, device, dataset):
-    """Evaluates the model on a given dataloader and returns ROC-AUC."""
-    model.eval()
-    all_preds = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for u_gids_batch, v_gids_batch, labels_batch in dataloader:
-            u_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in u_gids_batch]
-            v_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in v_gids_batch]
-            
-            u_type = dataset.nodes['type_map'][u_gids_batch[0].item()][0]
-            drug_type_id = dataset.node_name2type['drug']
-
-            if u_type == drug_type_id:
-                drug_lids, cell_lids = u_lids, v_lids
-            else:
-                drug_lids, cell_lids = v_lids, u_lids
-            
-            preds = model.link_prediction_forward(drug_lids, cell_lids, generator)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels_batch.cpu().numpy())
-            
-    if len(all_labels) == 0 or len(np.unique(all_labels)) < 2:
-        return 0.0
-        
-    return roc_auc_score(all_labels, all_preds)
+# --- The old evaluate() function is now removed from this file ---
 
 # --- Main Training Function ---
 def main():
@@ -113,18 +85,17 @@ def main():
     valid_loader = DataLoader(valid_dataset, batch_size=args.mini_batch_s)
     print(f"  > Created validation loader with {len(valid_pos)} positive and {len(valid_neg)} negative pairs.")
 
-    # --- Training Loop ---
+    # --- Training Loop & Logging Setup ---
     best_valid_auc = 0.0
     patience_counter = 0
     save_path = os.path.join(args.save_dir, f"{args.model_name}.pth")
     log_path = os.path.join(args.save_dir, f"{args.model_name}_log.csv")
-
-    #Add TensorBoard logging
     writer = SummaryWriter(log_dir=f'runs/{args.model_name}')
 
     with open(log_path, 'w', newline='') as log_file:
         csv_writer = csv.writer(log_file)
-        csv_writer.writerow(['epoch', 'lp_loss', 'rw_loss', 'val_auc'])
+        # Updated header for the new metrics
+        csv_writer.writerow(['epoch', 'lp_loss', 'rw_loss', 'val_auc', 'val_f1', 'val_mrr', 'lr', 'grad_norm'])
 
         print("\n--- Starting Model Training ---")
 
@@ -133,12 +104,12 @@ def main():
             model.train()
             total_lp_loss = 0
             total_rw_loss = 0
+            total_grad_norm = 0
 
-            # Curriculum learning for node isolation
+            # Curriculum learning setup
             max_isolation_ratio = 0.2
             current_isolation_ratio = max_isolation_ratio * (epoch / (args.epochs -1)) if args.epochs > 1 else 0
             
-            # Curriculum learning for LP loss weight
             current_lambda = 1.0
             if args.use_lp_curriculum:
                 max_lambda = args.lp_loss_lambda
@@ -162,10 +133,13 @@ def main():
                     drug_lids, cell_lids = v_lids, u_lids
 
                 loss = model.link_prediction_loss(drug_lids, cell_lids, labels, generator, current_isolation_ratio)
-                
                 weighted_loss = current_lambda * loss
                 weighted_loss.backward()
                 
+                # Calculate gradient norm before optimizer step
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                total_grad_norm += grad_norm.item()
+
                 optimizer.step()
                 total_lp_loss += loss.item()
                 lp_iterator.set_postfix({"Loss": total_lp_loss / (lp_iterator.n + 1)})
@@ -189,20 +163,23 @@ def main():
                         total_rw_loss += loss_rw.item()
                         rw_iterator.set_postfix({"Loss": total_rw_loss / (rw_iterator.n + 1)})
 
+            # Calculate average metrics for the epoch
             avg_lp_loss = total_lp_loss / len(train_loader) if train_loader else 0
+            avg_grad_norm = total_grad_norm / len(train_loader) if train_loader else 0
+            current_lr = optimizer.param_groups[0]['lr']
             avg_rw_loss = 0
             if args.use_rw_loss and rw_pairs:
                 num_rw_batches = (len(rw_batch) + args.mini_batch_s - 1) // args.mini_batch_s
                 avg_rw_loss = total_rw_loss / num_rw_batches if num_rw_batches > 0 else 0
 
             # --- Validation & Early Stopping ---
-            valid_auc_epoch = np.nan
+            val_metrics = {"ROC-AUC": np.nan, "F1-Score": np.nan, "MRR": np.nan}
             if (epoch + 1) % args.val_freq == 0:
-                valid_auc_epoch = evaluate(model, valid_loader, generator, device, dataset)
-                print(f"  Validation AUC: {valid_auc_epoch:.4f}")
+                val_metrics = evaluate_model(model, valid_loader, generator, device, dataset)
+                print(f"  Validation | AUC: {val_metrics['ROC-AUC']:.4f}, F1: {val_metrics['F1-Score']:.4f}, MRR: {val_metrics['MRR']:.4f}")
 
-                if valid_auc_epoch > best_valid_auc:
-                    best_valid_auc = valid_auc_epoch
+                if val_metrics['ROC-AUC'] > best_valid_auc:
+                    best_valid_auc = val_metrics['ROC-AUC']
                     patience_counter = 0
                     torch.save(model.state_dict(), save_path)
                     print(f"  New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
@@ -210,15 +187,24 @@ def main():
                     patience_counter += 1
                     if patience_counter >= args.patience:
                         print(f"  Stopping early as validation AUC has not improved for {patience_counter} checks.")
-                        csv_writer.writerow([epoch + 1, avg_lp_loss, avg_rw_loss, valid_auc_epoch])
-
-            # Log scalars to TensorBoard
+                        # Log final metrics before breaking
+                        # The logging logic below will handle this last entry
+                        break
+            
+            # Log all metrics to CSV and TensorBoard
+            log_row = [epoch + 1, avg_lp_loss, avg_rw_loss, val_metrics['ROC-AUC'], val_metrics['F1-Score'], val_metrics['MRR'], current_lr, avg_grad_norm]
+            csv_writer.writerow(log_row)
+            
             writer.add_scalar('Loss/Link_Prediction', avg_lp_loss, epoch + 1)
+            writer.add_scalar('Training/Learning_Rate', current_lr, epoch + 1)
+            writer.add_scalar('Training/Gradient_Norm', avg_grad_norm, epoch + 1)
             if args.use_rw_loss:
                 writer.add_scalar('Loss/Random_Walk', avg_rw_loss, epoch + 1)
-            if not np.isnan(valid_auc_epoch):
-                writer.add_scalar('AUC/Validation', valid_auc_epoch, epoch + 1)
-
+            if not np.isnan(val_metrics['ROC-AUC']):
+                writer.add_scalar('Validation/AUC', val_metrics['ROC-AUC'], epoch + 1)
+                writer.add_scalar('Validation/F1-Score', val_metrics['F1-Score'], epoch + 1)
+                writer.add_scalar('Validation/MRR', val_metrics['MRR'], epoch + 1)
+    
     writer.close()
     print("\n--- Training Complete ---")
     print(f"Best validation AUC: {best_valid_auc:.4f}")
