@@ -95,7 +95,7 @@ def main():
     with open(log_path, 'w', newline='') as log_file:
         csv_writer = csv.writer(log_file)
         # Updated header for the new metrics
-        csv_writer.writerow(['epoch', 'lp_loss', 'rw_loss', 'val_auc', 'val_f1', 'val_mrr', 'lr', 'grad_norm'])
+        csv_writer.writerow(['epoch', 'lp_loss', 'rw_loss', 'val_loss', 'val_auc', 'val_f1', 'val_mrr', 'lr', 'grad_norm'])
 
         print("\n--- Starting Model Training ---")
 
@@ -173,34 +173,38 @@ def main():
                 avg_rw_loss = total_rw_loss / num_rw_batches if num_rw_batches > 0 else 0
 
             # --- Validation & Early Stopping ---
-            val_metrics = {"ROC-AUC": np.nan, "F1-Score": np.nan, "MRR": np.nan}
+            val_metrics = {"Val_Loss": np.nan, "ROC-AUC": np.nan, "F1-Score": np.nan, "MRR": np.nan}
             if (epoch + 1) % args.val_freq == 0:
                 val_metrics = evaluate_model(model, valid_loader, generator, device, dataset)
-                print(f"  Validation | AUC: {val_metrics['ROC-AUC']:.4f}, F1: {val_metrics['F1-Score']:.4f}, MRR: {val_metrics['MRR']:.4f}")
+                print(f"  Validation | Loss: {val_metrics['Val_Loss']:.4f}, AUC: {val_metrics['ROC-AUC']:.4f}, F1: {val_metrics['F1-Score']:.4f}, MRR: {val_metrics['MRR']:.4f}")
 
                 if val_metrics['ROC-AUC'] > best_valid_auc:
                     best_valid_auc = val_metrics['ROC-AUC']
                     patience_counter = 0
                     torch.save(model.state_dict(), save_path)
-                    print(f"  New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
+                    print(f"  ✨ New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
                 else:
                     patience_counter += 1
                     if patience_counter >= args.patience:
                         print(f"  Stopping early as validation AUC has not improved for {patience_counter} checks.")
-                        # Log final metrics before breaking
-                        # The logging logic below will handle this last entry
                         break
             
             # Log all metrics to CSV and TensorBoard
-            log_row = [epoch + 1, avg_lp_loss, avg_rw_loss, val_metrics['ROC-AUC'], val_metrics['F1-Score'], val_metrics['MRR'], current_lr, avg_grad_norm]
+            log_row = [
+                epoch + 1, avg_lp_loss, avg_rw_loss, 
+                val_metrics['Val_Loss'], val_metrics['ROC-AUC'], val_metrics['F1-Score'], val_metrics['MRR'],
+                current_lr, avg_grad_norm
+            ]
             csv_writer.writerow(log_row)
             
-            writer.add_scalar('Loss/Link_Prediction', avg_lp_loss, epoch + 1)
+            writer.add_scalar('Loss/Train_LP', avg_lp_loss, epoch + 1)
             writer.add_scalar('Training/Learning_Rate', current_lr, epoch + 1)
             writer.add_scalar('Training/Gradient_Norm', avg_grad_norm, epoch + 1)
             if args.use_rw_loss:
-                writer.add_scalar('Loss/Random_Walk', avg_rw_loss, epoch + 1)
+                writer.add_scalar('Loss/Train_RW', avg_rw_loss, epoch + 1)
+            
             if not np.isnan(val_metrics['ROC-AUC']):
+                writer.add_scalar('Loss/Validation_LP', val_metrics['Val_Loss'], epoch + 1)
                 writer.add_scalar('Validation/AUC', val_metrics['ROC-AUC'], epoch + 1)
                 writer.add_scalar('Validation/F1-Score', val_metrics['F1-Score'], epoch + 1)
                 writer.add_scalar('Validation/MRR', val_metrics['MRR'], epoch + 1)

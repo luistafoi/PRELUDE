@@ -114,7 +114,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Classify drug-cell links using per-drug GMMs.")
-    parser.add_argument('--input-file', default='/data/luis/HetGNN Data Processing/Repurposing_Public_24Q2_LMFI_NORMALIZED_with_DrugNames.csv',
+    parser.add_argument('--input-file', default='/data/luis/PRELUDE/data/misc/Repurposing_Public_24Q2_LMFI_NORMALIZED_with_DrugNames.csv',
                         help='Path to the raw drug response CSV file.')
     parser.add_argument('--output-file', default='data/raw/link_cell_drug_labeled.txt',
                         help='Path to save the new labeled link file.')
