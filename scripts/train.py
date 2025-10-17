@@ -23,15 +23,48 @@ from utils.evaluation import evaluate_model # <-- Import from the new utility fi
 
 # --- Helper: Memory-Efficient Dataset for Link Prediction ---
 class LinkPredictionDataset(Dataset):
-    """Custom Dataset for link prediction to handle large numbers of links."""
-    def __init__(self, pos_links, neg_links):
-        u_nodes = [p[0] for p in pos_links] + [n[0] for n in neg_links]
-        v_nodes = [p[1] for p in pos_links] + [n[1] for n in neg_links]
-        labels = [1.0] * len(pos_links) + [0.0] * len(neg_links)
+    """
+    Custom Dataset for link prediction. Handles on-the-fly negative sampling.
+    """
+    def __init__(self, positive_links, full_dataset: PRELUDEDataset, neg_sample_ratio=1):
+        self.positive_links = positive_links
+        self.full_dataset = full_dataset
+        self.neg_sample_ratio = neg_sample_ratio
+
+        # Get all possible drug nodes for negative sampling
+        drug_type_id = self.full_dataset.node_name2type['drug']
+        self.all_drug_gids = [gid for gid, (ntype, _) in self.full_dataset.nodes['type_map'].items() if ntype == drug_type_id]
+
+        # Create a set of existing positive links for fast lookup during negative sampling
+        self.existing_pos_links = set(positive_links)
+
+        # Generate negative samples
+        self.negative_links = self._generate_negative_samples()
+
+        # Combine and create final arrays
+        u_nodes = [p[0] for p in self.positive_links] + [n[0] for n in self.negative_links]
+        v_nodes = [p[1] for p in self.positive_links] + [n[1] for n in self.negative_links]
+        labels = [1.0] * len(self.positive_links) + [0.0] * len(self.negative_links)
 
         self.u_nodes = np.array(u_nodes, dtype=np.int64)
         self.v_nodes = np.array(v_nodes, dtype=np.int64)
         self.labels = np.array(labels, dtype=np.float32)
+
+    def _generate_negative_samples(self):
+        neg_links = []
+        num_neg_samples = len(self.positive_links) * self.neg_sample_ratio
+        
+        while len(neg_links) < num_neg_samples:
+            # Get a cell from a random positive link
+            cell_gid, _ = random.choice(self.positive_links)
+            # Get a random drug
+            neg_drug_gid = random.choice(self.all_drug_gids)
+
+            # Check if this is a true negative
+            if (cell_gid, neg_drug_gid) not in self.existing_pos_links:
+                neg_links.append((cell_gid, neg_drug_gid))
+        
+        return neg_links
 
     def __len__(self):
         return len(self.labels)
@@ -71,19 +104,19 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # --- Prepare DataLoaders using pre-defined splits ---
-    print("\nLoading pre-split and GMM-filtered training/validation data...")
+    print("\nLoading data using new splits...")
     
-    train_pos = dataset.links['train_pos']
-    train_neg = dataset.links['train_neg']
-    train_dataset = LinkPredictionDataset(train_pos, train_neg)
+    # Training data
+    train_pos = dataset.links['train_lp']
+    train_dataset = LinkPredictionDataset(train_pos, dataset, neg_sample_ratio=1)
     train_loader = DataLoader(train_dataset, batch_size=args.mini_batch_s, shuffle=True)
-    print(f"  > Created training loader with {len(train_pos)} positive and {len(train_neg)} negative pairs.")
+    print(f"  > Created training loader with {len(train_dataset)} links ({len(train_pos)} positive).")
     
-    valid_pos = dataset.links['valid_pos']
-    valid_neg = dataset.links['valid_neg']
-    valid_dataset = LinkPredictionDataset(valid_pos, valid_neg)
+    # Validation data (Inductive)
+    valid_pos = dataset.links['valid_inductive']
+    valid_dataset = LinkPredictionDataset(valid_pos, dataset, neg_sample_ratio=1)
     valid_loader = DataLoader(valid_dataset, batch_size=args.mini_batch_s)
-    print(f"  > Created validation loader with {len(valid_pos)} positive and {len(valid_neg)} negative pairs.")
+    print(f"  > Created validation loader with {len(valid_dataset)} links ({len(valid_pos)} positive).")
 
     # --- Training Loop & Logging Setup ---
     best_valid_auc = 0.0
@@ -107,10 +140,10 @@ def main():
             total_grad_norm = 0
 
             # Curriculum learning setup
-            max_isolation_ratio = 0.2
-            current_isolation_ratio = max_isolation_ratio * (epoch / (args.epochs -1)) if args.epochs > 1 else 0
+            max_isolation_ratio = 0.5
+            current_isolation_ratio = max_isolation_ratio * (epoch / (args.epochs - 1)) if args.epochs > 1 else 0
             
-            current_lambda = 1.0
+            current_lambda = 1000.0
             if args.use_lp_curriculum:
                 max_lambda = args.lp_loss_lambda
                 current_lambda = max_lambda * (epoch / (args.epochs - 1)) if args.epochs > 1 else max_lambda

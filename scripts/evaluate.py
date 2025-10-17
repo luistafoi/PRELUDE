@@ -19,68 +19,7 @@ from dataloaders.feature_loader import FeatureLoader
 from models.tools import HetAgg
 from scripts.train import LinkPredictionDataset # Re-use the dataset class
 
-def evaluate_model(model, dataloader, generator, device, dataset):
-    """
-    Evaluates the model on a given dataloader and returns a dictionary of metrics.
-    Calculates ROC-AUC, F1-Score, and Mean Reciprocal Rank (MRR).
-    """
-    model.eval()
-    all_preds = []
-    all_labels = []
-    # For MRR, we group predictions by the cell to rank drugs for that cell
-    preds_by_cell = defaultdict(list)
-
-    with torch.no_grad():
-        for u_gids_batch, v_gids_batch, labels_batch in dataloader:
-            u_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in u_gids_batch]
-            v_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in v_gids_batch]
-            
-            u_type = dataset.nodes['type_map'][u_gids_batch[0].item()][0]
-            drug_type_id = dataset.node_name2type['drug']
-
-            # Ensure drug_lids and cell_lids are correctly assigned
-            if u_type == drug_type_id:
-                drug_lids, cell_lids = u_lids, v_lids
-                cell_gids = v_gids_batch.numpy()
-            else:
-                drug_lids, cell_lids = v_lids, u_lids
-                cell_gids = u_gids_batch.numpy()
-            
-            preds = model.link_prediction_forward(drug_lids, cell_lids, generator)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels_batch.cpu().numpy())
-
-            # Group predictions by cell ID for MRR
-            batch_preds = preds.cpu().numpy()
-            batch_labels = labels_batch.cpu().numpy()
-            for i in range(len(cell_gids)):
-                cell_id = cell_gids[i]
-                preds_by_cell[cell_id].append((batch_preds[i], batch_labels[i]))
-
-    if len(all_labels) < 2 or len(np.unique(all_labels)) < 2:
-        return {"ROC-AUC": 0.0, "F1-Score": 0.0, "MRR": 0.0}
-
-    roc_auc = roc_auc_score(all_labels, all_preds)
-    f1 = f1_score(np.array(all_labels), np.array(all_preds) > 0.5)
-
-    # Calculate Mean Reciprocal Rank (MRR)
-    reciprocal_ranks = []
-    for cell_id, predictions in preds_by_cell.items():
-        # Only consider cells that have at least one true positive link in the test set
-        if any(label == 1.0 for score, label in predictions):
-            # Sort predictions for this cell by score, descending
-            predictions.sort(key=lambda x: x[0], reverse=True)
-            # Find the rank of the first true positive drug
-            for rank, (score, label) in enumerate(predictions):
-                if label == 1.0:
-                    reciprocal_ranks.append(1.0 / (rank + 1))
-                    break
-    
-    mrr = np.mean(reciprocal_ranks) if reciprocal_ranks else 0.0
-
-    return {"ROC-AUC": roc_auc, "F1-Score": f1, "MRR": mrr}
-
+from utils.evaluation import evaluate_model # Use the centralized evaluation function
 
 def main():
     args = read_args()
@@ -92,6 +31,7 @@ def main():
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # --- Load Common Components ---
     dataset = PRELUDEDataset(args.data_dir)
     feature_loader = FeatureLoader(dataset, device)
     generator = DataGenerator(args.data_dir).load_train_neighbors(os.path.join(args.data_dir, "train_neighbors.txt"))
@@ -102,25 +42,43 @@ def main():
     print(f"\nLoading trained model weights from: {args.load_path}")
     model.load_state_dict(torch.load(args.load_path, map_location=device, weights_only=True))
     
-    # --- Prepare Test DataLoader using pre-defined splits ---
-    print("\nLoading pre-split and GMM-filtered test data...")
-    
-    test_pos = dataset.links['test_pos']
-    test_neg = dataset.links['test_neg']
-    
-    print(f"  > Evaluating on {len(test_pos)} positive and {len(test_neg)} negative test pairs.")
-    test_dataset = LinkPredictionDataset(test_pos, test_neg)
-    test_loader = DataLoader(test_dataset, batch_size=args.mini_batch_s)
+    # --- Test 1: Transductive Evaluation ---
+    print("\n--- Evaluating: Test Set 1 (Transductive Edge Prediction) ---")
+    test_1_pos = dataset.links['test_transductive']
+    if test_1_pos:
+        test_1_dataset = LinkPredictionDataset(test_1_pos, dataset, neg_sample_ratio=1)
+        test_1_loader = DataLoader(test_1_dataset, batch_size=args.mini_batch_s)
+        
+        print(f"  > Evaluating on {len(test_1_dataset)} links ({len(test_1_pos)} positive).")
+        metrics_1 = evaluate_model(model, test_1_loader, generator, device, dataset)
 
-    # --- Evaluate ---
-    print("\nRunning final evaluation on the test set...")
-    metrics = evaluate_model(model, test_loader, generator, device, dataset)
+        print("\n--- Test Set 1 Performance ---")
+        print(f"  Loss:     {metrics_1.get('Val_Loss', 'N/A'):.4f}")
+        print(f"  ROC-AUC:  {metrics_1['ROC-AUC']:.4f}")
+        print(f"  F1-Score: {metrics_1['F1-Score']:.4f}")
+        print(f"  MRR:      {metrics_1['MRR']:.4f}")
+        print("----------------------------------")
+    else:
+        print("  > No transductive test links found. Skipping.")
 
-    print("\n--- Final Test Set Performance ---")
-    print(f"  ROC-AUC:  {metrics['ROC-AUC']:.4f}")
-    print(f"  F1-Score: {metrics['F1-Score']:.4f}")
-    print(f"  MRR:      {metrics['MRR']:.4f}")
-    print("----------------------------------")
+    # --- Test 2: Inductive Evaluation ---
+    print("\n--- Evaluating: Test Set 2 (Inductive Node Isolation) ---")
+    test_2_pos = dataset.links['test_inductive']
+    if test_2_pos:
+        test_2_dataset = LinkPredictionDataset(test_2_pos, dataset, neg_sample_ratio=1)
+        test_2_loader = DataLoader(test_2_dataset, batch_size=args.mini_batch_s)
+
+        print(f"  > Evaluating on {len(test_2_dataset)} links ({len(test_2_pos)} positive).")
+        metrics_2 = evaluate_model(model, test_2_loader, generator, device, dataset)
+
+        print("\n--- Test Set 2 Performance ---")
+        print(f"  Loss:     {metrics_2.get('Val_Loss', 'N/A'):.4f}")
+        print(f"  ROC-AUC:  {metrics_2['ROC-AUC']:.4f}")
+        print(f"  F1-Score: {metrics_2['F1-Score']:.4f}")
+        print(f"  MRR:      {metrics_2['MRR']:.4f}")
+        print("----------------------------------")
+    else:
+        print("  > No inductive test links found. Skipping.")
 
 if __name__ == "__main__":
     main()

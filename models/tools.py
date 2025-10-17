@@ -32,7 +32,6 @@ class HetAgg(nn.Module):
         # --- 1. Feature Projection Layers (Instead of nn.Embedding) ---
         self.feat_proj = nn.ModuleDict()
         
-        # For drugs and genes, we use a Linear layer to project pre-trained features
         drug_feat_dim = self.feature_loader.drug_features.shape[1]
         self.feat_proj[str(drug_type_id)] = nn.Linear(drug_feat_dim, self.embed_d).to(device)
         
@@ -46,7 +45,7 @@ class HetAgg(nn.Module):
             full_vae = CellLineVAE(vae_dims).to(device)
             if os.path.exists(args.vae_checkpoint):
                 full_vae.load_state_dict(torch.load(args.vae_checkpoint, weights_only=True))
-                print(f" Loaded VAE weights from: {args.vae_checkpoint}")
+                print(f"Loaded VAE weights from: {args.vae_checkpoint}")
             self.cell_encoder = full_vae.encoder
         
         elif args.use_static_cell_embeddings:
@@ -78,7 +77,7 @@ class HetAgg(nn.Module):
         """
         super(HetAgg, self).train(mode)
         
-        if self.args.use_vae_encoder:
+        if hasattr(self, 'cell_encoder'):
             # Always keep the VAE encoder in evaluation mode
             self.cell_encoder.eval()
         return self
@@ -139,8 +138,12 @@ class HetAgg(nn.Module):
             raw_features = self.feature_loader.gene_features[local_id_batch]
             return self.feat_proj[str(node_type)](raw_features)
 
-    def node_het_agg(self, id_batch_local, node_type, data_generator: DataGenerator):
+    def node_het_agg(self, id_batch_local, node_type, data_generator: DataGenerator, excluded_link_types=None):
         """Performs full GNN message passing using the pre-generated neighbor list."""
+
+        if excluded_link_types is None:
+            excluded_link_types = set()
+        
         if data_generator.train_neighbors is None:
             raise RuntimeError("Training neighbors not loaded in DataGenerator. Call load_train_neighbors() first.")
 
@@ -160,11 +163,21 @@ class HetAgg(nn.Module):
                         if neigh_str.startswith(nt_name):
                             try:
                                 neigh_local_id = int(neigh_str[len(nt_name):])
-                                parsed_neighbors[nt_id].append(neigh_local_id)
-                                break
+                                
+                                # --- START OF FIX ---
+                                # Find the link type for this specific neighbor interaction
+                                neighbor_node_type = self.dataset.node_name2type[nt_name]
+                                current_link_type = self.dataset.link_type_lookup.get((node_type, neighbor_node_type), -1)
+
+                                # Only add the neighbor if its link type is not excluded
+                                if current_link_type not in excluded_link_types:
+                                    parsed_neighbors[nt_id].append(neigh_local_id)
+                                # --- END OF FIX ---
+                                
+                                break 
                             except ValueError:
                                 continue
-                
+
                 for nt in self.node_types:
                     num_samples = 10 # This should be configured in args eventually
                     neigh_list = parsed_neighbors.get(nt, [])
@@ -197,10 +210,10 @@ class HetAgg(nn.Module):
         
         return current_embeds
 
-    def get_combined_embedding(self, id_batch_local, node_type, data_generator):
+    def get_combined_embedding(self, id_batch_local, node_type, data_generator, excluded_link_types=None):
         """Concatenates initial features with final GNN embeddings for skip connections."""
         initial_embeds = self.conteng_agg(id_batch_local, node_type)
-        final_embeds = self.node_het_agg(id_batch_local, node_type, data_generator)
+        final_embeds = self.node_het_agg(id_batch_local, node_type, data_generator, excluded_link_types)
         
         if self.args.use_skip_connection:
             return torch.cat([initial_embeds, final_embeds], dim=1)
@@ -211,29 +224,69 @@ class HetAgg(nn.Module):
         drug_type_id = self.dataset.node_name2type[self.drug_type_name]
         cell_type_id = self.dataset.node_name2type[self.cell_type_name]
 
-        drug_embeds = self.get_combined_embedding(drug_indices_local, drug_type_id, data_generator)
+        # --- New Curriculum Node Isolation Logic ---
+        if self.args.use_node_isolation and isolation_ratio > 0 and self.training:
+            # 1. Identify unique cells in the batch and select which ones to isolate
+            unique_cell_ids = list(set(cell_indices_local))
+            num_to_isolate = int(len(unique_cell_ids) * isolation_ratio)
+            if num_to_isolate == 0:
+                # Fallback to original logic if no cells would be isolated
+                drug_embeds = self.get_combined_embedding(drug_indices_local, drug_type_id, data_generator)
+                cell_embeds = self.get_combined_embedding(cell_indices_local, cell_type_id, data_generator)
+                scores = self.lp_bilinear(drug_embeds, cell_embeds).squeeze(-1)
+                return F.binary_cross_entropy_with_logits(scores, labels.float())
 
-        if self.args.use_node_isolation and isolation_ratio > 0:
-            initial_cell_embeds = self.conteng_agg(cell_indices_local, cell_type_id)
-            final_cell_embeds = torch.zeros_like(initial_cell_embeds)
+            cells_to_isolate = set(random.sample(unique_cell_ids, k=num_to_isolate))
             
-            should_isolate = torch.rand(len(cell_indices_local), device=self.device) < isolation_ratio
-            graph_connected_mask = ~should_isolate
+            # 2. Create masks for isolated and non-isolated links in the batch
+            is_isolated_mask = torch.tensor([c in cells_to_isolate for c in cell_indices_local], device=self.device)
+            is_not_isolated_mask = ~is_isolated_mask
 
-            if graph_connected_mask.any():
-                connected_ids = [cell_indices_local[i] for i, connected in enumerate(graph_connected_mask) if connected]
-                if connected_ids:
-                    final_cell_embeds[graph_connected_mask] = self.node_het_agg(connected_ids, cell_type_id, data_generator)
+            total_loss = 0.0
             
-            if should_isolate.any():
-                final_cell_embeds[should_isolate] = initial_cell_embeds[should_isolate]
+            # 3. Calculate loss for non-isolated links (standard message passing)
+            if torch.any(is_not_isolated_mask):
+                non_isolated_drugs = [d for i, d in enumerate(drug_indices_local) if is_not_isolated_mask[i]]
+                non_isolated_cells = [c for i, c in enumerate(cell_indices_local) if is_not_isolated_mask[i]]
+                non_isolated_labels = labels[is_not_isolated_mask]
 
-            cell_embeds = torch.cat([initial_cell_embeds, final_cell_embeds], dim=1) if self.args.use_skip_connection else final_cell_embeds
-        else:
+                drug_embeds1 = self.get_combined_embedding(non_isolated_drugs, drug_type_id, data_generator)
+                cell_embeds1 = self.get_combined_embedding(non_isolated_cells, cell_type_id, data_generator)
+                
+                scores1 = self.lp_bilinear(drug_embeds1, cell_embeds1).squeeze(-1)
+                total_loss += F.binary_cross_entropy_with_logits(scores1, non_isolated_labels.float())
+
+            # 4. Calculate loss for isolated links (cells are drug-ignorant)
+            if torch.any(is_isolated_mask):
+                isolated_drugs = [d for i, d in enumerate(drug_indices_local) if is_isolated_mask[i]]
+                isolated_cells = [c for i, c in enumerate(cell_indices_local) if is_isolated_mask[i]]
+                isolated_labels = labels[is_isolated_mask]
+
+                # Get drug embeddings normally
+                drug_embeds2 = self.get_combined_embedding(isolated_drugs, drug_type_id, data_generator)
+                
+                # Get cell embeddings with drug links excluded for message passing
+                cell_drug_link_type = self.dataset.link_type_lookup.get((cell_type_id, drug_type_id), -1)
+                if cell_drug_link_type == -1:
+                    raise ValueError("Could not find cell-drug link type in link_type_lookup")
+
+                cell_embeds2 = self.get_combined_embedding(
+                    isolated_cells, 
+                    cell_type_id, 
+                    data_generator, 
+                    excluded_link_types={cell_drug_link_type}
+                )
+                
+                scores2 = self.lp_bilinear(drug_embeds2, cell_embeds2).squeeze(-1)
+                total_loss += F.binary_cross_entropy_with_logits(scores2, isolated_labels.float())
+                
+            return total_loss
+
+        else: # Original logic if isolation is off or not in training mode
+            drug_embeds = self.get_combined_embedding(drug_indices_local, drug_type_id, data_generator)
             cell_embeds = self.get_combined_embedding(cell_indices_local, cell_type_id, data_generator)
-            
-        scores = self.lp_bilinear(drug_embeds, cell_embeds).squeeze(-1)
-        return F.binary_cross_entropy_with_logits(scores, labels.float())
+            scores = self.lp_bilinear(drug_embeds, cell_embeds).squeeze(-1)
+            return F.binary_cross_entropy_with_logits(scores, labels.float())
 
     def link_prediction_forward(self, drug_indices_local, cell_indices_local, data_generator):
         drug_type_id = self.dataset.node_name2type[self.drug_type_name]

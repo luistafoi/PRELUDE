@@ -32,7 +32,7 @@ def read_args():
                         help='Mini-batch size for link prediction training.')
     parser.add_argument('--patience', type=int, default=50,
                         help='Patience for early stopping (in validation checks).')
-    parser.add_argument('--val_freq', type=int, default=5,
+    parser.add_argument('--val_freq', type=int, default=1,
                         help='How often to run validation (in epochs).')
     parser.add_argument('--random_seed', default=42, type=int)
 
@@ -51,7 +51,7 @@ def read_args():
                         help='Comma-separated dims for VAE layers.')
     parser.add_argument('--use_lp_curriculum', action='store_true',
                         help='Enable curriculum learning for the LP loss weight.')
-    parser.add_argument('--lp_loss_lambda', type=float, default=10.0,
+    parser.add_argument('--lp_loss_lambda', type=float, default=100.0,
                         help='The maximum weight for the LP loss when curriculum is enabled.')
     parser.add_argument('--use_static_cell_embeddings', action='store_true',
                         help='(Faster) Use pre-computed VAE embeddings from a file for cell feature.')
